@@ -374,7 +374,6 @@ class VisionTransformer(nn.Module):
         x,
         keep_all_patches = False
     ):
-        import ipdb; ipdb.set_trace()
         device = x.device
 
         x = self.to_tokens(x)
@@ -797,7 +796,7 @@ class CLIP(nn.Module):
         t - sequence dimension along text tokens
         i - sequence dimension along image tokens
         """
-        import ipdb; ipdb.set_trace()
+
         if self.use_all_token_embeds:
             # fine-grained CLIP logic
             sim_text_to_image = einsum('m x t d, n y i d -> m n x y t i', text_latents, image_latents) * temp
