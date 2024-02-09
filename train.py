@@ -23,7 +23,7 @@ import torchvision.transforms as T
 from Q_utils import extract_impression, get_parameter_count
 from simple_tokenizer import SimpleTokenizer
 from openai_model import build_model
-from x_clip import CLIP, TextTransformer, VisionTransformer
+from x_clip import CLIP, TextTransformer, VisionTransformer, SPARC
 from dataloaders import get_mimic_dataloader, get_chexpert_test_loader_and_gt, get_mimic_test_loader_and_gt
 from eval import eval
 
@@ -88,20 +88,36 @@ def main(args):
     image_encoder = VisionTransformer(**vision_transformer_config)
     text_encoder = TextTransformer(**text_transformer_config)
 
-    clip = CLIP(
-        image_encoder = image_encoder,
-        text_encoder = text_encoder,
-        dim_image = 512,
-        dim_text = 512,
-        dim_latent= 512,
-        use_all_token_embeds = args.use_all_token_embeds, # whether to use fine-grained contrastive learning (FILIP)
-        decoupled_contrastive_learning = args.decoupled_contrastive_learning, # use decoupled contrastive learning (DCL) objective function, removing positive pairs from the denominator of the InfoNCE loss (CLOOB + DCL)
-        extra_latent_projection = args.extra_latent_projection, # whether to use separate projections for text-to-image vs image-to-text comparisons (CLOOB)
-        use_visual_ssl = args.use_visual_ssl, # whether to do self supervised learning on images
-        use_mlm = args.use_mlm, # use masked language learning (MLM) on text (DeCLIP)
-        text_ssl_loss_weight = args.text_ssl_loss_weight, # weight for text MLM loss
-        image_ssl_loss_weight = args.image_ssl_loss_weight # weight for image self-supervised learning loss
-    ).to('cuda')
+    if args.model=='clip':
+        clip = CLIP(
+            image_encoder = image_encoder,
+            text_encoder = text_encoder,
+            dim_image = 512,
+            dim_text = 512,
+            dim_latent= 512,
+            use_all_token_embeds = args.use_all_token_embeds, # whether to use fine-grained contrastive learning (FILIP)
+            decoupled_contrastive_learning = args.decoupled_contrastive_learning, # use decoupled contrastive learning (DCL) objective function, removing positive pairs from the denominator of the InfoNCE loss (CLOOB + DCL)
+            extra_latent_projection = args.extra_latent_projection, # whether to use separate projections for text-to-image vs image-to-text comparisons (CLOOB)
+            use_visual_ssl = args.use_visual_ssl, # whether to do self supervised learning on images
+            use_mlm = args.use_mlm, # use masked language learning (MLM) on text (DeCLIP)
+            text_ssl_loss_weight = args.text_ssl_loss_weight, # weight for text MLM loss
+            image_ssl_loss_weight = args.image_ssl_loss_weight # weight for image self-supervised learning loss
+        ).to('cuda')
+    elif args.model=='sparc':
+        clip = SPARC(
+            image_encoder = image_encoder,
+            text_encoder = text_encoder,
+            dim_image = 512,
+            dim_text = 512,
+            dim_latent= 512,
+            decoupled_contrastive_learning = args.decoupled_contrastive_learning, # use decoupled contrastive learning (DCL) objective function, removing positive pairs from the denominator of the InfoNCE loss (CLOOB + DCL)
+            extra_latent_projection = args.extra_latent_projection, # whether to use separate projections for text-to-image vs image-to-text comparisons (CLOOB)
+            use_visual_ssl = args.use_visual_ssl, # whether to do self supervised learning on images
+            use_mlm = args.use_mlm, # use masked language learning (MLM) on text (DeCLIP)
+            text_ssl_loss_weight = args.text_ssl_loss_weight, # weight for text MLM loss
+            image_ssl_loss_weight = args.image_ssl_loss_weight # weight for image self-supervised learning loss
+        ).to('cuda')
+
 
     optimizer = torch.optim.SGD(clip.parameters(), lr=0.0001, momentum=0.9)
 
@@ -168,6 +184,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--log_every', type=int, default=100)
     parser.add_argument('--save_dir', type=str, default='outputs')
+    parser.add_argument('--model', type=str, choices=['clip', 'sparc'], default='clip')
     
     # x-clip options
     parser.add_argument('--visual_patch_dropout', type=float, default=0) # flip

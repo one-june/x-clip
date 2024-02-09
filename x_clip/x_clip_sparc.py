@@ -56,13 +56,21 @@ def l2norm(t):
 
 def matrix_diag(t):
     device = t.device
-    i, j = t.shape[-2:]
+    if t.ndim==3: #(mxn,b,b)
+        i, j = t.shape[-2:]
+    elif t.ndim==4: #(mxn,b,t,t)
+        b, i, j = t.shape[-3:]
+    else:
+        raise NotImplementedError('input dimension should be 3 or 4')
     num_diag_el = min(i, j)
     i_range = torch.arange(i, device = device)
     j_range = torch.arange(j, device = device)
     diag_mask = rearrange(i_range, 'i -> i 1') == rearrange(j_range, 'j -> 1 j')
     diag_el = t.masked_select(diag_mask)
-    return rearrange(diag_el, '(b d) -> b d', d = num_diag_el)
+    if t.ndim==3:
+        return rearrange(diag_el, '(b d) -> b d', d = num_diag_el)
+    elif t.ndim==4:
+        return rearrange(diag_el, '(m b d) -> m b d', b=b, d=num_diag_el)
 
 # checkpointing helper function
 
@@ -103,292 +111,23 @@ def groupby_prefix_and_trim(prefix, d):
     kwargs_without_prefix = dict(map(lambda x: (x[0][len(prefix):], x[1]), tuple(kwargs_with_prefix.items())))
     return kwargs_without_prefix, kwargs
 
+def min_max_norm(sim, axis=-1): # axis should be direction of comparison
+    min_val = torch.min(sim, dim=axis, keepdim=True)[0]
+    max_val = torch.max(sim, dim=axis, keepdim=True)[0]
+    norm_sim = (sim-min_val)/(max_val-min_val)
+    return norm_sim
+
+def devide_by_sum(sim, axis=-1):
+    sum_val = torch.sum(sim, dim=axis, keepdim=True)
+    norm_sim = sim/sum_val
+    return norm_sim
+
+
 # helper classes
 
 class RearrangeImage(nn.Module):
     def forward(self, x):
         return rearrange(x, 'b (h w) c -> b c h w', h = int(math.sqrt(x.shape[1])))
-
-class LayerNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.g = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
-        var = torch.var(x, dim = -1, unbiased = False, keepdim = True)
-        mean = torch.mean(x, dim = -1, keepdim = True)
-        return (x - mean) * (var + eps).rsqrt() * self.g
-
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = LayerNorm(dim)
-        self.fn = fn
-
-    def forward(self, x, *args, **kwargs):
-        return self.fn(self.norm(x), *args, **kwargs)
-
-# patch dropout
-
-class PatchDropout(nn.Module):
-    def __init__(self, prob):
-        super().__init__()
-        assert 0 <= prob < 1.
-        self.prob = prob
-
-    def forward(self, x, force_keep_all = False):
-        if not self.training or self.prob == 0. or force_keep_all:
-            return x
-
-        b, n, _, device = *x.shape, x.device
-
-        batch_indices = torch.arange(b, device = device)
-        batch_indices = rearrange(batch_indices, '... -> ... 1')
-        num_patches_keep = max(1, int(n * (1 - self.prob)))
-        patch_indices_keep = torch.randn(b, n, device = device).topk(num_patches_keep, dim = -1).indices
-
-        return x[batch_indices, patch_indices_keep]
-
-# rotary positional embedding
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        inv_freq = 1. / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
-
-    def forward(self, seq_len, device):
-        inv_freq = self.inv_freq
-        t = torch.arange(seq_len, device = device).type_as(inv_freq)
-        freqs = torch.einsum('i , j -> i j', t, inv_freq)
-        return torch.cat((freqs, freqs), dim = -1)
-
-def rotate_half(x):
-    x = rearrange(x, '... (j d) -> ... j d', j = 2)
-    x1, x2 = x.unbind(dim = -2)
-    return torch.cat((-x2, x1), dim = -1)
-
-def apply_rotary_pos_emb(freqs, t):
-    rot_dim = freqs.shape[-1]
-    t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-    t = (t * freqs.cos()) + (rotate_half(t) * freqs.sin())
-    return torch.cat((t, t_pass), dim = -1)
-
-# transformer
-
-class GEGLU(nn.Module):
-    def forward(self, x):
-        x, gate = x.chunk(2, dim = -1)
-        return x * F.gelu(gate)
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, mult = 4, dropout = 0.):
-        super().__init__()
-        inner_dim = int(dim * mult)
-
-        self.net = nn.Sequential(
-            nn.Linear(dim, inner_dim * 2, bias = False),
-            GEGLU(),
-            LayerNorm(inner_dim),
-            nn.Dropout(dropout),
-            nn.Linear(inner_dim, dim, bias = False)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class Attention(nn.Module):
-    def __init__(self, dim, dim_head = 64, heads = 8, causal = False, dropout = 0.):
-        super().__init__()
-        self.heads = heads
-        self.causal = causal
-        self.scale = dim_head ** -0.5
-        inner_dim = dim_head * heads
-
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim, bias = False), LayerNorm(dim))
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask = None, rotary_pos_emb = None):
-        h, device, scale = self.heads, x.device, self.scale
-
-        q, k, v = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
-
-        q = q * self.scale
-
-        if exists(rotary_pos_emb):
-            apply_rotary = partial(apply_rotary_pos_emb, rotary_pos_emb)
-            q, k, v = map(apply_rotary, (q, k, v))
-
-        sim = einsum('b h i d, b h j d -> b h i j', q, k)
-
-        mask_value = -torch.finfo(sim.dtype).max
-
-        if exists(mask):
-            mask = rearrange(mask, 'b j -> b 1 1 j')
-            sim = sim.masked_fill(~mask, mask_value)
-
-        if self.causal:
-            i, j = sim.shape[-2:]
-            causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
-            sim = sim.masked_fill(causal_mask, mask_value)
-
-        attn = sim.softmax(dim = -1, dtype = torch.float32)
-        attn = attn.type(sim.dtype)
-
-        attn = self.dropout(attn)
-
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
-
-class Transformer(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        depth,
-        dim_head = 64,
-        heads = 8,
-        causal = False,
-        attn_dropout = 0.,
-        ff_dropout = 0.,
-        ff_mult = 4,
-        checkpoint_during_training = False
-    ):
-        super().__init__()
-        self.checkpoint_during_training = checkpoint_during_training
-
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(dim = dim, dim_head = dim_head, heads = heads, causal = causal, dropout = attn_dropout)),
-                PreNorm(dim, FeedForward(dim = dim, mult = ff_mult)),
-            ]))
-
-        self.norm_in = LayerNorm(dim)
-        self.norm_out = LayerNorm(dim)
-
-    def forward(
-        self,
-        x,
-        rotary_pos_emb = None,
-        mask = None
-    ):
-        can_checkpoint = self.training and self.checkpoint_during_training
-        checkpoint_fn = make_checkpointable if can_checkpoint else identity
-
-        x = self.norm_in(x)
-
-        for attn, ff in self.layers:
-            attn, ff = map(checkpoint_fn, (attn, ff))
-
-            x = attn(x, mask, rotary_pos_emb) + x
-            x = ff(x) + x
-
-        return self.norm_out(x)
-
-# text and vision transformers
-
-class TextTransformer(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        num_tokens,
-        max_seq_len,
-        dim_head,
-        rotary_pos_emb = None,
-        causal = False,
-        **kwargs
-    ):
-        super().__init__()
-        self.token_emb = nn.Embedding(num_tokens, dim)
-
-        self.abs_pos_emb = nn.Embedding(max_seq_len, dim) if not rotary_pos_emb else None
-        self.rotary_pos_emb = RotaryEmbedding(min(dim_head, 32)) if rotary_pos_emb else None
-
-        self.cls_token = nn.Parameter(torch.randn(dim)) if not causal else None
-
-        self.transformer = Transformer(dim, dim_head = dim_head, causal = causal, **kwargs)
-
-    def forward(self, x, mask = None):
-        b, n, device = *x.shape, x.device
-
-        x = self.token_emb(x)
-
-        if exists(self.abs_pos_emb):
-            pos_emb = self.abs_pos_emb(torch.arange(n, device = device))
-            x = x + rearrange(pos_emb, 'n d -> 1 n d')
-
-        rotary_pos_emb = None
-        if exists(self.rotary_pos_emb):
-            rotary_pos_emb = self.rotary_pos_emb(n + 1, device = device)
-
-        if exists(self.cls_token):
-            cls_tokens = repeat(self.cls_token, 'd -> b 1 d', b = b)
-            x = torch.cat((cls_tokens, x), dim = 1)
-
-            if exists(mask):
-                mask = F.pad(mask, (1, 0), value = True)
-
-        out = self.transformer(x, mask = mask, rotary_pos_emb = rotary_pos_emb)
-        return out
-
-class VisionTransformer(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        image_size,
-        patch_size,
-        channels,
-        patch_dropout = 0.5,
-        **kwargs
-    ):
-        super().__init__()
-        assert image_size % patch_size == 0, 'Image dimensions must be divisible by the patch size.'
-        num_patches = (image_size // patch_size) ** 2
-        patch_dim = channels * patch_size ** 2
-
-        self.to_tokens = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_size, p2 = patch_size),
-            nn.Linear(patch_dim, dim)
-        )
-
-        self.pos_emb = nn.Embedding(num_patches, dim)
-        self.patch_dropout = PatchDropout(patch_dropout)
-
-        self.transformer = Transformer(dim, **kwargs)
-
-        self.to_cls_tokens = nn.Sequential(
-            Reduce('b n d -> b d', 'mean'),
-            nn.Linear(dim, dim, bias = False),
-            Rearrange('b d -> b 1 d')
-        )
-
-    def forward(
-        self,
-        x,
-        keep_all_patches = False
-    ):
-        # import ipdb; ipdb.set_trace()
-        device = x.device
-
-        x = self.to_tokens(x)
-        b, n, _ = x.shape
-
-        pos_emb = self.pos_emb(torch.arange(n, device = device))
-        x = x + rearrange(pos_emb, 'n d -> 1 n d')
-
-        x = self.patch_dropout(x, force_keep_all = keep_all_patches)
-
-        out = self.transformer(x)
-
-        cls_tokens = self.to_cls_tokens(out)
-        return torch.cat((cls_tokens, out), dim = 1)
 
 
 # contrastive learning functions
@@ -412,7 +151,7 @@ def model_forward_with_context(
 
 # main clip class
 
-class CLIP(nn.Module):
+class SPARC(nn.Module):
     def __init__(
         self,
         *,
@@ -440,7 +179,7 @@ class CLIP(nn.Module):
         visual_patch_dropout = 0.5,
         visual_has_cls_token = True,
         channels = 3,
-        use_all_token_embeds = False,
+        use_all_token_embeds = True,
         downsample_image_embeds = False,
         decoupled_contrastive_learning = False,
         extra_latent_projection = False,
@@ -703,37 +442,40 @@ class CLIP(nn.Module):
             return enc_text, enc_image
 
         # depending on whether to do fine-grained CLIP or not, select either all tokens, or CLS tokens only
-
-        if self.use_all_token_embeds:
+        
+        if self.use_all_token_embeds: # get both local, global latent
             assert enc_text.ndim == 3, 'encoded text must have 3 dimensions (batch, seq, features)'
             assert enc_image.ndim == 3, 'encoded image must have 3 dimensions (batch, seq [height x width], features)'
-            text_embeds = enc_text[:, 1:] if self.text_has_cls_token else enc_text
-            image_embeds = enc_image[:, 1:] if self.visual_has_cls_token else enc_image
-        else:
-            text_embeds = enc_text[:, 0] if enc_text.ndim == 3 else enc_text
-            image_embeds = enc_image[:, 0] if enc_image.ndim == 3 else enc_image
+            local_text_embeds = enc_text[:, 1:] if self.text_has_cls_token else enc_text
+            local_image_embeds = enc_image[:, 1:] if self.visual_has_cls_token else enc_image
+
+            glob_text_embeds = enc_text[:, 0] if enc_text.ndim == 3 else enc_text
+            glob_image_embeds = enc_image[:, 0] if enc_image.ndim == 3 else enc_image
 
         # project to latents
-        text_latents = self.to_text_latent(text_embeds)
-        image_latents = self.to_visual_latent(image_embeds)
-        text_latents, image_latents = map(l2norm, (text_latents, image_latents))
+        glob_text_latents = self.to_text_latent(glob_text_embeds) # TODO: need non-linear layer before converting to latent
+        glob_image_latents = self.to_visual_latent(glob_image_embeds) # TODO: need non-linear layer before converting to latent
+        glob_text_latents, glob_image_latents = map(l2norm, (glob_text_latents, glob_image_latents))
+
+        local_text_latents = self.to_text_latent(local_text_embeds)
+        local_image_latents = self.to_visual_latent(local_image_embeds)
 
         # calculate another set of latents for image to text (vs text to image)
         # proposed by CLOOB
 
-        text_latents_extra, image_latents_extra = text_latents, image_latents
+        text_latents_extra, image_latents_extra = glob_text_latents, glob_image_latents
         if self.extra_latent_projection:
-            text_latents_extra = self.to_text_latent_extra(text_embeds)
-            image_latents_extra = self.to_visual_latent_extra(image_embeds)
+            text_latents_extra = self.to_text_latent_extra(glob_text_embeds)
+            image_latents_extra = self.to_visual_latent_extra(glob_image_embeds)
             text_latents_extra, image_latents_extra = map(l2norm, (text_latents_extra, image_latents_extra))
 
         # whether to early return latents
 
         if return_latents:
             if self.extra_latent_projection:
-                return text_latents, image_latents, text_latents_extra, image_latents_extra
+                return glob_text_latents, glob_image_latents, text_latents_extra, image_latents_extra
 
-            return text_latents, image_latents
+            return glob_text_latents, glob_image_latents
 
         # get temperature
 
@@ -742,17 +484,19 @@ class CLIP(nn.Module):
         # early return, if needed
 
         if not return_loss and self.use_all_token_embeds:
-            einsum_args = (text_latents_extra, image_latents_extra) if self.extra_latent_projection and not text_to_image else (text_latents, image_latents)
+            einsum_args = (text_latents_extra, image_latents_extra) if self.extra_latent_projection and not text_to_image else (local_text_latents, local_image_latents)
             return einsum('b t d, b i d -> b t i', *einsum_args) * temp
 
         if not return_loss and not self.use_all_token_embeds:
-            einsum_args = (text_latents_extra, image_latents_extra) if self.extra_latent_projection and not text_to_image else (text_latents, image_latents)
+            einsum_args = (text_latents_extra, image_latents_extra) if self.extra_latent_projection and not text_to_image else (glob_text_latents, glob_image_latents)
             return einsum('b d, b d -> b', *einsum_args) * temp
 
         # split out multiview dimension for text and images
 
-        text_latents = rearrange(text_latents, '(m b) ... -> m b ...', m = num_batch_texts)
-        image_latents = rearrange(image_latents, '(m b) ... -> m b ...', m = num_batch_images)
+        glob_text_latents = rearrange(glob_text_latents, '(m b) ... -> m b ...', m = num_batch_texts) # (m b d)
+        glob_image_latents = rearrange(glob_image_latents, '(m b) ... -> m b ...', m = num_batch_images)
+        local_text_latents = rearrange(local_text_latents, '(m b) ... -> m b ...', m = num_batch_texts) # (m b t d)
+        local_image_latents = rearrange(local_image_latents, '(m b) ... -> m b ...', m = num_batch_texts)
 
         if self.extra_latent_projection:
             text_latents_extra = rearrange(text_latents_extra, '(m b) ... -> m b ...', m = num_batch_texts)
@@ -761,9 +505,9 @@ class CLIP(nn.Module):
         # maybe distributed all gather
 
         if self.requires_all_gather:
-            latents = torch.stack((text_latents, image_latents))
+            latents = torch.stack((glob_text_latents, glob_image_latents))
             latents, sizes = all_gather(latents, 2, None)
-            text_latents, image_latents = latents
+            glob_text_latents, glob_image_latents = latents
 
             batch = sizes.sum().item()
 
@@ -776,11 +520,11 @@ class CLIP(nn.Module):
 
         sim_reg_loss = 0.
 
-        if self.has_sim_reg_loss:
+        if self.has_sim_reg_loss: 
             diag_mask = torch.eye(batch, device = device, dtype = torch.bool)
             off_diag_mask = rearrange(~diag_mask, '... -> 1 ...')
 
-            text_sim, image_sim, text_extra_sim, image_extra_sim = map(lambda t: einsum('m i ... d, m j ... d -> m ... i j', t, t)[off_diag_mask], (text_latents, image_latents, text_latents_extra, image_latents_extra))
+            text_sim, image_sim, text_extra_sim, image_extra_sim = map(lambda t: einsum('m i ... d, m j ... d -> m ... i j', t, t)[off_diag_mask], (glob_text_latents, glob_image_latents, text_latents_extra, image_latents_extra))
 
             sim_reg_loss = (
                 F.mse_loss(text_sim, image_sim) +
@@ -797,62 +541,84 @@ class CLIP(nn.Module):
         t - sequence dimension along text tokens
         i - sequence dimension along image tokens
         """
-        import ipdb; ipdb.set_trace()
+        # import ipdb; ipdb.set_trace()
         if self.use_all_token_embeds:
-            # fine-grained CLIP logic
-            sim_text_to_image = einsum('m x t d, n y i d -> m n x y t i', text_latents, image_latents) * temp
-
-            sim_image_to_text = sim_text_to_image
-            if self.extra_latent_projection:
-                sim_image_to_text = einsum('m x t d, n y i d -> m n x y t i', text_latents_extra, image_latents_extra) * temp
-
-            text_to_image = reduce(sim_text_to_image, '... t i -> ... t', 'max')
-            text_to_image_mask = rearrange(text_mask, '(m b) t -> m 1 b 1 t', m = num_batch_texts)
-            text_to_image = masked_mean(text_to_image, text_to_image_mask, dim = -1)
-
-            image_to_text_mask = rearrange(text_mask, '(m b) t -> m 1 b 1 t 1', m = num_batch_texts)
-            masked_sim = sim_image_to_text.masked_fill(~image_to_text_mask, max_neg_value(sim_image_to_text.dtype))
-            image_to_text = reduce(reduce(masked_sim, '... t i -> ... i', 'max'), '... i -> ...', 'mean')
-        else:
-            text_to_image = einsum('m t d, n i d -> m n t i', text_latents, image_latents) * temp
-            image_to_text = rearrange(text_to_image, '... t i -> ... i t')
+            # --- global clip loss ---
+            global_text_to_image = einsum('m x d, n y d -> m n x y', glob_text_latents, glob_image_latents) * temp # (m,b,d), (n,b,d) -> (m,n,b,b)
+            global_image_to_text = rearrange(global_text_to_image, '... t i -> ... i t')
 
             if self.extra_latent_projection:
                 image_to_text = einsum('m t d, n i d -> m n i t', text_latents_extra, image_latents_extra) * temp
 
+            # --- fine-grained CLIP logic ---
+            sim_text_to_image = einsum('m x t d, n y i d -> m n x y t i', local_text_latents, local_image_latents) * temp
+            # sparsify & normalize
+            sparse_text_to_image = min_max_norm(sim_text_to_image, axis=-1)
+            threshold = 1/sim_text_to_image.size(-1) # threshold=1/P
+            sparse_text_to_image = torch.where(sparse_text_to_image<threshold, torch.zeros_like(sparse_text_to_image), sparse_text_to_image) # convert to 0 when sim lower than threshold
+            sparse_text_to_image = devide_by_sum(sparse_text_to_image, axis=-1) 
+            # alignment-weighting
+            text_grouped_image_latents = einsum('m n x y t i, n y i d -> m n x y t d', sparse_text_to_image, local_image_latents)
+            text_grouped_image_latents, local_text_latents = map(l2norm, (text_grouped_image_latents, local_text_latents))
+            # only select positive pair
+            text_grouped_image_latents_pos = [text_grouped_image_latents[:,:,x,x,:,:] for x in range(text_grouped_image_latents.size(2))]
+            text_grouped_image_latents = torch.stack(text_grouped_image_latents_pos, dim=2) # (m,n,x,t,d)
+            # calculate sim
+            local_text_to_grouped = einsum('m x t d, m n x i d -> m n x t i', local_text_latents, text_grouped_image_latents) * temp
+            # mask
+            text_to_grouped_mask = rearrange(text_mask, '(m b) t -> m 1 b t 1', m=num_batch_texts)
+            grouped_to_text_mask = rearrange(text_mask, '(m b) t -> m 1 b 1 t', m=num_batch_texts)
+            overall_mask = einsum('m n b t i, m n b i k -> m n b t k', text_to_grouped_mask, grouped_to_text_mask) # (m,n,x,t,t)
+            local_text_to_grouped = local_text_to_grouped.masked_fill(~overall_mask, 0.) * torch.ones(overall_mask.shape).sum() / overall_mask.sum()
+            local_grouped_to_text = rearrange(local_text_to_grouped, '... t i -> ... i t')
+
+
         # calculate loss
 
-        text_to_image = rearrange(text_to_image, 'm n ... -> (m n) ...')
-        image_to_text = rearrange(image_to_text, 'm n ... -> (m n) ...')
+        global_text_to_image = rearrange(global_text_to_image, 'm n ... -> (m n) ...') #(m,n,b,b) -> (mxn,b,b)
+        global_image_to_text = rearrange(global_image_to_text, 'm n ... -> (m n) ...') 
+        local_text_to_grouped = rearrange(local_text_to_grouped, 'm x ... -> (m x) ...') #(m,n,b,t,t) -> (mxn,b,t,t)
+        local_grouped_to_text = rearrange(local_grouped_to_text, 'm x ... -> (m x) ...')
 
         # exponentiate
 
-        text_to_image_exp, image_to_text_exp = map(torch.exp, (text_to_image, image_to_text))
-
+        text_to_image_exp, image_to_text_exp = map(torch.exp, (global_text_to_image, global_image_to_text))
+        text_to_grouped_exp, grouped_to_text_exp = map(torch.exp, (local_text_to_grouped, local_grouped_to_text))
+        
         # numerators
-
-        text_to_image_pos, image_to_text_pos = map(matrix_diag, (text_to_image_exp, image_to_text_exp))
+        text_to_image_pos, image_to_text_pos = map(matrix_diag, (text_to_image_exp, image_to_text_exp)) #(mxn,b)
+        text_to_grouped_pos, grouped_to_text_pos = map(matrix_diag, (text_to_grouped_exp, grouped_to_text_exp)) #(mxn,b,t)
 
         # denominator
 
         if self.decoupled_contrastive_learning:
             pos_mask = torch.eye(batch, device = device, dtype = torch.bool)
             text_to_image_exp, image_to_text_exp = map(lambda t: t.masked_fill(pos_mask, 0.), (text_to_image_exp, image_to_text_exp))
+            # [TODO]: grouped not implemented
+            raise NotImplementedError('local grouped loss not implemented on decoupled_contrastive_learning')
 
-        text_to_image_denom, image_to_text_denom = map(lambda t: t.sum(dim = -1), (text_to_image_exp, image_to_text_exp))
+        text_to_image_denom, image_to_text_denom = map(lambda t: t.sum(dim = -1), (text_to_image_exp, image_to_text_exp)) #(mxn,b)
+        text_to_grouped_denom, grouped_to_text_denom = map(lambda t: t.sum(dim = -1), (text_to_grouped_exp, grouped_to_text_exp)) #(mxn,b,t)
 
         # loss
 
-        text_to_image_loss = (-log(text_to_image_pos) + log(text_to_image_denom)).mean(dim = -1)
+        text_to_image_loss = (-log(text_to_image_pos) + log(text_to_image_denom)).mean(dim = -1) #(mxn)
         image_to_text_loss = (-log(image_to_text_pos) + log(image_to_text_denom)).mean(dim = -1)
+        text_to_grouped_loss = (-log(text_to_grouped_pos) + log(text_to_grouped_denom)).mean(dim = -1).mean(dim = -1) #(mxn)
+        grouped_to_text_loss = (-log(grouped_to_text_pos) + log(grouped_to_text_denom)).mean(dim = -1).mean(dim = -1)
+
 
         # calculate CL loss
 
-        cl_losses = (text_to_image_loss + image_to_text_loss) / 2
+        global_cl_losses = (text_to_image_loss + image_to_text_loss) / 2
+        local_cl_losses = (text_to_grouped_loss + grouped_to_text_loss) / 2
+
 
         # get main CL loss vs multiview CL losses
 
-        cl_loss, multiview_cl_loss = cl_losses[0], cl_losses[1:]
+        global_cl_loss, global_multiview_cl_loss = global_cl_losses[0], global_cl_losses[1:]
+        local_cl_loss, local_multiview_cl_loss = local_cl_losses[0], local_cl_losses[1:]
+
 
         # if no augmented text or images passed in, multiview loss weight is 0
 
@@ -862,14 +628,15 @@ class CLIP(nn.Module):
 
         cl_loss_weight = 1 - (self.text_ssl_loss_weight + self.image_ssl_loss_weight + multiview_loss_weight)
 
-        loss = (cl_loss * cl_loss_weight) \
+        loss = (global_cl_loss * cl_loss_weight/2) \
+            + (local_cl_loss * cl_loss_weight/2) \
             + (text_ssl_loss * self.text_ssl_loss_weight) \
             + (image_ssl_loss * self.image_ssl_loss_weight)
 
         # add multiview CL loss with weight
 
         if is_multiview:
-            loss = loss + multiview_cl_loss.mean() * multiview_loss_weight
+            loss = loss + (global_multiview_cl_loss.mean() + local_multiview_cl_loss.mean()) * multiview_loss_weight/2
 
         # add similarity regularization loss with weight if needed
 
