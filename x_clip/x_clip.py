@@ -845,7 +845,7 @@ class CLIP(nn.Module):
 
         text_to_image_loss = (-log(text_to_image_pos) + log(text_to_image_denom)).mean(dim = -1)
         image_to_text_loss = (-log(image_to_text_pos) + log(image_to_text_denom)).mean(dim = -1)
-
+        #jj
         # calculate CL loss
 
         cl_losses = (text_to_image_loss + image_to_text_loss) / 2
