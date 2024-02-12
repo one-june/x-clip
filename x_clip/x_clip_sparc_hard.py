@@ -586,7 +586,6 @@ class SPARC(nn.Module):
         text_to_grouped_exp, grouped_to_text_exp = map(torch.exp, (local_text_to_grouped, local_grouped_to_text))
         
         # numerators
-        
         text_to_image_pos, image_to_text_pos = map(matrix_diag, (text_to_image_exp, image_to_text_exp)) #(mxn,b)
         text_to_grouped_pos, grouped_to_text_pos = map(matrix_diag, (text_to_grouped_exp, grouped_to_text_exp)) #(mxn,b,t)
 
