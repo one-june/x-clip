@@ -21,13 +21,17 @@ chexzero_transforms = T.Compose(
     )
 
 class MIMICDataset(Dataset):
-    def __init__(self, mimic_root, df, transform=None):
+    def __init__(self, mimic_root, df, img_size=256, transform=None):
         self.mimic_root = mimic_root
         # self.df = pd.read_csv(df_path)
         self.df = df
-        
-        if transform is not None:
-            self.transform = transform
+
+        self.transform = T.Compose(
+            [
+                T.Normalize((101.48761, 101.48761, 101.48761), (83.43944, 83.43944, 83.43944)),
+                T.Resize(img_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+            ]
+        )
 
     def __len__(self):
         return len(self.df)
@@ -42,10 +46,18 @@ class MIMICDataset(Dataset):
                                 f"s{str(int(row['study_id']))}.txt")
         with open(txt_path, 'r') as handle:
             report = handle.read()
-        # findings = extract_findings(report)
+
         impression = extract_impression(report)
         # txt = preprocess_text(impression) # tokenize
-        txt = impression
+
+        findings = extract_findings(report).split('.')
+        findings = [f for f in findings if f != '']
+        if len(findings)>0:
+            selected_idx = np.random.randint(0, len(findings))
+            selected_findings = findings[selected_idx]
+            txt = selected_findings + '. ' + impression
+        else:
+            txt = impression
         
         jpg_path = os.path.join(self.mimic_root, 'files',
                                 f"p{str(int(row['subject_id']))[:2]}",
@@ -71,8 +83,10 @@ class MIMICDataset(Dataset):
         img = np.repeat(img, 3, axis=0)
         img = torch.from_numpy(img)
         img = img.type(torch.FloatTensor)
-        if self.transform:
-            img = self.transform(img)
+        # img = (img-torch.min(img))/(torch.max(img)-torch.min(img))
+        if self.transform is not None:
+            img = self.transform(img) #vanilla, dinov2
+            # img = self.transform(images=img, return_tensors='pt') #openai-clip
         
         out = {"img": img, "txt": txt}
         return out
@@ -82,7 +96,7 @@ def get_mimic_dataloader(mimic_root='/home/wonjun/data/mimic-cxr-jpg-resized512'
                             split='train',
                             shuffle=True,
                             transform=chexzero_transforms,
-                            batch_size=1):
+                            batch_size=1, img_size=256, multi_gpu=False):
     
     split_df_path = os.path.join(mimic_root, 'mimic-cxr-2.0.0-split.csv')
     metadata_path = os.path.join(mimic_root, 'mimic-cxr-2.0.0-metadata.csv')
@@ -92,19 +106,26 @@ def get_mimic_dataloader(mimic_root='/home/wonjun/data/mimic-cxr-jpg-resized512'
     df = pd.merge(df, metadata, how='left', on=['subject_id', 'study_id', 'dicom_id'])
     df = df[df['ViewPosition'].isin(['AP', 'PA'])]
     # df = df.sample(500)
-    
     dataset = MIMICDataset(mimic_root = mimic_root,
                            df = df,
+                           img_size=img_size,
                            transform=transform)
+    
+    if multi_gpu:
+        sampler = torch.utils.data.DistributedSampler(dataset, shuffle=shuffle)
+    else:
+        sampler = torch.utils.data.RandomSampler(dataset, replacement=False) #equal to set shuffle=True
+
     loader = DataLoader(dataset,
+                        sampler=sampler,
                         batch_size=batch_size,
-                        shuffle=shuffle,
+                        # shuffle=shuffle,
                         num_workers=os.cpu_count(),
                         drop_last=False)
     return loader
 
 def get_mimic_test_loader_and_gt(mimic_root='/home/wonjun/data/mimic-cxr-jpg-resized512',
-                                transform=chexzero_transforms,
+                                transform=chexzero_transforms, img_size=256,
                                 label_columns = ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Enlarged Cardiomediastinum', 'Fracture', 'Lung Lesion', 'Lung Opacity', 'Pleural Effusion', 'Pleural Other', 'Pneumonia', 'Pneumothorax', 'Support Devices']):
     
     split_df_path = os.path.join(mimic_root, 'mimic-cxr-2.0.0-split.csv')
@@ -121,6 +142,7 @@ def get_mimic_test_loader_and_gt(mimic_root='/home/wonjun/data/mimic-cxr-jpg-res
     # Get test set dataloader
     dataset = MIMICDataset(mimic_root=mimic_root,
                            df=df,
+                           img_size = img_size,
                            transform=transform)
     loader = DataLoader(dataset,
                         batch_size=1,

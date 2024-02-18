@@ -111,15 +111,15 @@ def groupby_prefix_and_trim(prefix, d):
     kwargs_without_prefix = dict(map(lambda x: (x[0][len(prefix):], x[1]), tuple(kwargs_with_prefix.items())))
     return kwargs_without_prefix, kwargs
 
-def min_max_norm(sim, axis=-1): # axis should be direction of comparison
+def min_max_norm(sim, axis=-1, eps=1e-06): # axis should be direction of comparison
     min_val = torch.min(sim, dim=axis, keepdim=True)[0]
     max_val = torch.max(sim, dim=axis, keepdim=True)[0]
-    norm_sim = (sim-min_val)/(max_val-min_val)
+    norm_sim = (sim-min_val)/(max_val-min_val+eps)
     return norm_sim
 
-def devide_by_sum(sim, axis=-1):
+def devide_by_sum(sim, axis=-1, eps=1e-6):
     sum_val = torch.sum(sim, dim=axis, keepdim=True)
-    norm_sim = sim/sum_val
+    norm_sim = sim/(sum_val+eps)
     return norm_sim
 
 
@@ -129,25 +129,6 @@ class RearrangeImage(nn.Module):
     def forward(self, x):
         return rearrange(x, 'b (h w) c -> b c h w', h = int(math.sqrt(x.shape[1])))
 
-
-# contrastive learning functions
-
-def model_forward_with_context(
-    *,
-    fn,
-    args,
-    freeze,
-):
-    encoding_context = null_context if not freeze else torch.no_grad
-
-    fn = fn.to('cuda')
-    with encoding_context():
-        enc = fn(*args)
-
-        if freeze:
-            enc.detach_()
-
-    return enc
 
 # main clip class
 
@@ -313,6 +294,12 @@ class SPARC(nn.Module):
             )
         else:
             self.to_visual_latent = nn.Linear(dim_image, dim_latent, bias = False)
+            self.single_nonlinear_layer = nn.Sequential(
+                nn.Linear(dim_image, dim_image*4),
+                nn.GELU(),
+                nn.Linear(dim_image*4, dim_image),
+                nn.Dropout(0.5)
+            )
 
         # temperature
 
@@ -350,8 +337,13 @@ class SPARC(nn.Module):
         freeze_text_encoder = False,    # text encoder is not trained if this is set to True
         text_to_image = True,           # in the case the extra projection is turned on, would return different similarity values depending on modality directionality
         aug_text = None,                # augmented text (for multiview)
-        aug_image = None                # augmented image (for multiview)
+        aug_image = None,                # augmented image (for multiview)
+        local_weight = 0.5,
+        **args
     ):
+        # import ipdb; ipdb.set_trace()
+        # text_mask = text.attention_mask
+        # text = text.input_ids
         batch, device = text.shape[0], text.device
 
         # derive text mask
@@ -404,11 +396,16 @@ class SPARC(nn.Module):
         if not self.text_encode_without_mask:
             text_args = (*text_args, text_mask)
 
-        enc_text = model_forward_with_context(
-            fn = self.text_transformer,
-            args = text_args,
-            freeze = freeze_text_encoder
-        )
+        # import ipdb; ipdb.set_trace()
+        if freeze_text_encoder:
+            with torch.no_grad():
+                enc_text = self.text_transformer(input_ids=text,
+                                                attention_mask=text_mask)['last_hidden_state']
+                enc_text.detach_()
+        else:
+            enc_text = self.text_transformer(input_ids=text,
+                                                attention_mask=text_mask)['last_hidden_state']
+
 
         # depending on whether text is using causal mask, post process, moving eos token to the first position
 
@@ -430,11 +427,18 @@ class SPARC(nn.Module):
             enc_text = torch.cat((eos_tokens, rest_tokens), dim = 1)
 
         # whether to train image encoder, in the case that the image net was pretrained as recommended in LiT
-        enc_image = model_forward_with_context(
-            fn = self.visual_transformer,
-            args = (image,),
-            freeze = freeze_image_encoder
-        )
+        encoding_context = null_context if not freeze_image_encoder else torch.no_grad
+        # import ipdb; ipdb.set_trace()
+        if freeze_image_encoder:
+            with torch.no_grad():
+                # enc_image = self.visual_transformer(image)[0] #dinov2
+                # enc_image = self.visual_transformer(image)
+                enc_image = self.visual_transformer(image).last_hidden_state #openai-clip
+                enc_image.detach_()
+        else:
+            # enc_image = self.visual_transformer(image)[0] #dinov2
+            # enc_image = self.visual_transformer(image)
+            enc_image = self.visual_transformer(image).last_hidden_state #openai-clip
 
         # early return of encodings, if needed (for DALL-E2)
 
@@ -453,8 +457,8 @@ class SPARC(nn.Module):
             glob_image_embeds = enc_image[:, 0] if enc_image.ndim == 3 else enc_image
 
         # project to latents
-        glob_text_latents = self.to_text_latent(glob_text_embeds) # TODO: need non-linear layer before converting to latent
-        glob_image_latents = self.to_visual_latent(glob_image_embeds) # TODO: need non-linear layer before converting to latent
+        glob_text_latents = self.to_text_latent(glob_text_embeds) 
+        glob_image_latents = self.to_visual_latent(self.single_nonlinear_layer(glob_image_embeds)) # TODO: need non-linear layer before converting to latent, single? MLP?
         glob_text_latents, glob_image_latents = map(l2norm, (glob_text_latents, glob_image_latents))
 
         local_text_latents = self.to_text_latent(local_text_embeds)
@@ -551,6 +555,7 @@ class SPARC(nn.Module):
                 image_to_text = einsum('m t d, n i d -> m n i t', text_latents_extra, image_latents_extra) * temp
 
             # --- fine-grained CLIP logic ---
+            local_text_latents, local_image_latents = map(l2norm,(local_text_latents, local_image_latents))
             sim_text_to_image = einsum('m x t d, n y i d -> m n x y t i', local_text_latents, local_image_latents) * temp
             # sparsify & normalize
             sparse_text_to_image = min_max_norm(sim_text_to_image, axis=-1)
@@ -558,35 +563,41 @@ class SPARC(nn.Module):
             sparse_text_to_image = torch.where(sparse_text_to_image<threshold, torch.zeros_like(sparse_text_to_image), sparse_text_to_image) # convert to 0 when sim lower than threshold
             sparse_text_to_image = devide_by_sum(sparse_text_to_image, axis=-1) 
             # alignment-weighting
-            text_grouped_image_latents = einsum('m n x y t i, n y i d -> m n x y t d', sparse_text_to_image, local_image_latents)
-            text_grouped_image_latents, local_text_latents = map(l2norm, (text_grouped_image_latents, local_text_latents))
+            text_grouped_image_latents = einsum('m n x y t i, n y i d -> m x t d', sparse_text_to_image, local_image_latents)
+            text_grouped_image_latents, _ = map(l2norm, (text_grouped_image_latents, text_grouped_image_latents))
             # only select positive pair
-            text_grouped_image_latents_pos = [text_grouped_image_latents[:,:,x,x,:,:] for x in range(text_grouped_image_latents.size(2))]
-            text_grouped_image_latents = torch.stack(text_grouped_image_latents_pos, dim=2) # (m,n,x,t,d)
+            # text_grouped_image_latents_pos = [text_grouped_image_latents[:,:,x,x,:,:] for x in range(text_grouped_image_latents.size(2))]
+            # text_grouped_image_latents = torch.stack(text_grouped_image_latents_pos, dim=2) # (m,n,x,t,d)
             # calculate sim
-            local_text_to_grouped = einsum('m x t d, m n x i d -> m n x t i', local_text_latents, text_grouped_image_latents) * temp
+            # local_text_to_grouped = einsum('m x t d, m n x i d -> m n x t i', local_text_latents, text_grouped_image_latents) * temp
+            local_text_to_grouped = einsum('m x t d, m x i d -> m x t i', local_text_latents, text_grouped_image_latents) * temp
             # mask
-            text_to_grouped_mask = rearrange(text_mask, '(m b) t -> m 1 b t 1', m=num_batch_texts)
-            grouped_to_text_mask = rearrange(text_mask, '(m b) t -> m 1 b 1 t', m=num_batch_texts)
-            overall_mask = einsum('m n b t i, m n b i k -> m n b t k', text_to_grouped_mask, grouped_to_text_mask) # (m,n,x,t,t)
-            local_text_to_grouped = local_text_to_grouped.masked_fill(~overall_mask, 0.) * torch.ones(overall_mask.shape).sum() / overall_mask.sum()
+            text_mask = text_mask[:,1:].type(torch.bool) # delete classn
+            # text_to_grouped_mask = rearrange(text_mask, '(m b) t -> m 1 b t 1', m=num_batch_texts)
+            # grouped_to_text_mask = rearrange(text_mask, '(m b) t -> m 1 b 1 t', m=num_batch_texts)
+            # overall_mask = einsum('m n b t i, m n b i k -> m n b t k', text_to_grouped_mask, grouped_to_text_mask) # (m,n,x,t,t)
+            text_to_grouped_mask = rearrange(text_mask, '(m b) t -> m b t 1', m=num_batch_texts)
+            grouped_to_text_mask = rearrange(text_mask, '(m b) t -> m b 1 t', m=num_batch_texts)
+            overall_mask = einsum('m b t i, m b i k -> m b t k', text_to_grouped_mask, grouped_to_text_mask) # (m,x,t,t)
+            local_text_to_grouped = local_text_to_grouped.masked_fill(~overall_mask, max_neg_value(local_text_to_grouped.dtype))
             local_grouped_to_text = rearrange(local_text_to_grouped, '... t i -> ... i t')
-
 
         # calculate loss
 
         global_text_to_image = rearrange(global_text_to_image, 'm n ... -> (m n) ...') #(m,n,b,b) -> (mxn,b,b)
         global_image_to_text = rearrange(global_image_to_text, 'm n ... -> (m n) ...') 
-        local_text_to_grouped = rearrange(local_text_to_grouped, 'm x ... -> (m x) ...') #(m,n,b,t,t) -> (mxn,b,t,t)
-        local_grouped_to_text = rearrange(local_grouped_to_text, 'm x ... -> (m x) ...')
+        # local_text_to_grouped = rearrange(local_text_to_grouped, 'm x ... -> (m x) ...') #(m,n,b,t,t) -> (mxn,b,t,t)
+        # local_grouped_to_text = rearrange(local_grouped_to_text, 'm x ... -> (m x) ...')
 
         # exponentiate
 
         text_to_image_exp, image_to_text_exp = map(torch.exp, (global_text_to_image, global_image_to_text))
         text_to_grouped_exp, grouped_to_text_exp = map(torch.exp, (local_text_to_grouped, local_grouped_to_text))
+        # text_to_grouped_exp = torch.clamp(text_to_grouped_exp, min=1e-06)
+        # grouped_to_text_exp = torch.clamp(grouped_to_text_exp, min=1e-06)
         
         # numerators
-        
+
         text_to_image_pos, image_to_text_pos = map(matrix_diag, (text_to_image_exp, image_to_text_exp)) #(mxn,b)
         text_to_grouped_pos, grouped_to_text_pos = map(matrix_diag, (text_to_grouped_exp, grouped_to_text_exp)) #(mxn,b,t)
 
@@ -600,14 +611,19 @@ class SPARC(nn.Module):
 
         text_to_image_denom, image_to_text_denom = map(lambda t: t.sum(dim = -1), (text_to_image_exp, image_to_text_exp)) #(mxn,b)
         text_to_grouped_denom, grouped_to_text_denom = map(lambda t: t.sum(dim = -1), (text_to_grouped_exp, grouped_to_text_exp)) #(mxn,b,t)
-
+        # text_to_grouped_denom = torch.clamp(text_to_grouped_denom, min=1e-04)
+        # grouped_to_text_denom = torch.clamp(grouped_to_text_denom, min=1e-04)
         # loss
 
         text_to_image_loss = (-log(text_to_image_pos) + log(text_to_image_denom)).mean(dim = -1) #(mxn)
         image_to_text_loss = (-log(image_to_text_pos) + log(image_to_text_denom)).mean(dim = -1)
-        text_to_grouped_loss = (-log(text_to_grouped_pos) + log(text_to_grouped_denom)).mean(dim = -1).mean(dim = -1) #(mxn)
-        grouped_to_text_loss = (-log(grouped_to_text_pos) + log(grouped_to_text_denom)).mean(dim = -1).mean(dim = -1)
+        ttgl = -log(text_to_grouped_pos) + log(text_to_grouped_denom)
+        gttl = -log(grouped_to_text_pos) + log(grouped_to_text_denom)
+        text_to_grouped_loss = (ttgl.masked_fill(~text_mask.unsqueeze(0), 0)).sum(dim = -1).mean(dim = -1)/text_mask.sum() #(mxn)
+        grouped_to_text_loss = (gttl.masked_fill(~text_mask.unsqueeze(0), 0)).sum(dim = -1).mean(dim = -1)/text_mask.sum()
 
+        if torch.isnan(text_to_grouped_loss).sum()>0 or torch.isnan(grouped_to_text_loss).sum()>0:
+            import ipdb; ipdb.set_trace()
 
         # calculate CL loss
 
@@ -629,8 +645,8 @@ class SPARC(nn.Module):
 
         cl_loss_weight = 1 - (self.text_ssl_loss_weight + self.image_ssl_loss_weight + multiview_loss_weight)
 
-        loss = (global_cl_loss * cl_loss_weight/2) \
-            + (local_cl_loss * cl_loss_weight/2) \
+        loss = (0.5* global_cl_loss * cl_loss_weight) \
+            + (local_weight*local_cl_loss * cl_loss_weight) \
             + (text_ssl_loss * self.text_ssl_loss_weight) \
             + (image_ssl_loss * self.image_ssl_loss_weight)
 
@@ -643,5 +659,7 @@ class SPARC(nn.Module):
 
         if self.has_sim_reg_loss:
             loss = loss + sim_reg_loss * self.sim_reg_loss_weight
+
+        loss = {'loss': loss, 'global_loss': global_cl_loss, 'local_loss': local_cl_loss}
 
         return loss

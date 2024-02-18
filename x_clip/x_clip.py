@@ -611,7 +611,8 @@ class CLIP(nn.Module):
         freeze_text_encoder = False,    # text encoder is not trained if this is set to True
         text_to_image = True,           # in the case the extra projection is turned on, would return different similarity values depending on modality directionality
         aug_text = None,                # augmented text (for multiview)
-        aug_image = None                # augmented image (for multiview)
+        aug_image = None,                # augmented image (for multiview)
+        **args
     ):
         batch, device = text.shape[0], text.device
 
@@ -797,7 +798,7 @@ class CLIP(nn.Module):
         t - sequence dimension along text tokens
         i - sequence dimension along image tokens
         """
-        import ipdb; ipdb.set_trace()
+        # import ipdb; ipdb.set_trace()
         if self.use_all_token_embeds:
             # fine-grained CLIP logic
             sim_text_to_image = einsum('m x t d, n y i d -> m n x y t i', text_latents, image_latents) * temp
@@ -875,5 +876,7 @@ class CLIP(nn.Module):
 
         if self.has_sim_reg_loss:
             loss = loss + sim_reg_loss * self.sim_reg_loss_weight
+
+        loss = {'loss': loss}
 
         return loss

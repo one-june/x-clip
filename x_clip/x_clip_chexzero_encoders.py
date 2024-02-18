@@ -239,15 +239,15 @@ class RearrangeImage(nn.Module):
 
 class ImageEncoder(nn.Module):
     def __init__(self,
-                 input_resolution: int,
-                 patch_size: int,
-                 width: int,
-                 layers: int,
-                 heads: int,
-                 output_dim: int):
+                 input_resolution: int=320,
+                 patch_size: int=16,
+                 width: int=768,
+                 layers: int=12,
+                 heads: int=8):
+                #  output_dim: int=):
         super().__init__()
         self.input_resolution = input_resolution
-        self.output_dim = output_dim
+        # self.output_dim = output_dim
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
@@ -327,7 +327,7 @@ class TextEncoder(nn.Module):
         mask.triu_(1)  # zero out the lower diagonal
         return mask
     
-class CLIP(nn.Module):
+class ChexZero(nn.Module):
     def __init__(
         self,
         *,
